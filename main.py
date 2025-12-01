@@ -47,7 +47,7 @@ SMS_CLEAR_COUNT    = 2                   # deaktivace: 2 poslední body pod limi
 
 # A/U detection parametry
 REG_WIN               = 6                # délka regresního okna
-ANGLE_THRESHOLD_DEG   = 25.0             # minimální |úhel| pro kandidáta A/U
+ANGLE_THRESHOLD_DEG   = 15.0             # minimální |úhel| pro kandidáta A/U
 BUFFER_LIMIT_ONLINE   = 2000             # max počet bodů pro online buffer
 
 # SMS config
@@ -240,30 +240,42 @@ def send_sms_robust(phone_number: str, message: str, force_port=None, max_retrie
 ANALYZE_DEBUG = True  # nastav na False, až tě debug přestane zajímat
 
 
+# =============================================================
+# A/U DETEKCE – PŘESNĚ DLE ZADÁNÍ (UP, UP1, UP2…)
+# =============================================================
+ANALYZE_DEBUG = True  # případně přepni na False
+
+
 def analyze_pump_cycles(data):
     """
-    data: seznam (datetime, hladina_cm) v čase seřazený.
+    data: seznam (datetime, hladina_cm) seřazený v čase.
 
-    Algoritmus:
-    - jdeme po datech 6-bodovými okny (3+3),
-    - z každého okna spočítáme:
-        - přímku vlevo (3 body),
-        - přímku vpravo (3 body),
-        - průsečík,
-        - orientovaný úhel UP,
-    - pokud |UP| < ANGLE_THRESHOLD_DEG -> okno ignorujeme,
-    - jakmile najdeme okno s |UP| >= threshold, je to kandidát,
-    - posouváme okna po 1 bodu (UP, UP1, UP2, ...), dokud:
-        - nenarazíme na okno pod prahem, nebo
-        - se typ změní (A vs U),
-        - v rámci této posloupnosti vybíráme to s největším |UP|,
-    - z nejlepší šestice:
-        - pokud průsečík leží mezi 3. a 4. bodem -> použijeme průsečík,
-        - jinak vezmeme max/min z celé šestice podle znaménka UP,
-    - po přijetí extrému:
-        - nový start index = best_idx + 3 (4. bod šestice),
-    - vynutíme střídání A/U: po A jen U, po U jen A,
-    - z posloupnosti A/U bodů sestavíme cykly stejně jako předtím.
+    Algoritmus (přesně dle zadání):
+      - Procházíme data po 6-bodových oknech, index i = 0,1,2,...
+      - Pro každé okno:
+          * 3 body vlevo → přímka L
+          * 3 body vpravo → přímka R
+          * průsečík L,R → UP (orientovaný úhel)
+      - Pokud |UP| < threshold → posuneme se o 1 bod (i += 1).
+      - Pokud |UP| >= threshold → našli jsme kandidáta:
+          * uložíme UP, start_idx (UP)
+          * posuneme se o 1 bod a počítáme UP1
+          * pokud |UP1| > |UP| → kandidát je UP1
+          * opakujeme (UP2, UP3, …), dokud:
+              - |UPk| >= threshold a typ je stejný (A/U),
+              - a roste |UP|.
+          * jakmile |UPk| klesne pod předchozí maximum, nebo změní typ:
+              → jako extrém bereme tu šestici, kde bylo |UP| největší.
+      - Z extrémní šestice:
+          1) Pokud průsečík časově leží mezi 3. a 4. bodem šestice:
+               → A/U bod = průsečík (čas + hladina).
+          2) Jinak:
+               → A/U bod = max/min celé šestice podle znaménka UP
+                 (UP>0 → U=minimum; UP<0 → A=maximum).
+      - Po nalezení A/U:
+          * nový index i = best_idx + 3 (4. bod šestice).
+      - Vynucujeme střídání A/U (po A jen U, po U jen A).
+      - Z posloupnosti A/U bodů vytvoříme cykly.
     """
 
     n = len(data)
@@ -274,8 +286,12 @@ def analyze_pump_cycles(data):
         if ANALYZE_DEBUG:
             print(*args)
 
+    REG_WIN = 6  # délka okna
+    # Prahový úhel – nastav si globálně, funkce používá tuto konstantu:
+    TH = ANGLE_THRESHOLD_DEG  # předpokládám, že máš nahoře např. ANGLE_THRESHOLD_DEG = 25.0
+
     # ---------------------------------------------------------
-    # Pomocná funkce: lineární regrese pro 3 body
+    # Pomocná: lineární regrese pro 3 body
     # ---------------------------------------------------------
     def linreg_3pts(pts):
         xs = [p[0] for p in pts]
@@ -284,7 +300,7 @@ def analyze_pump_cycles(data):
         ym = sum(ys) / 3.0
         num = sum((xs[k] - xm) * (ys[k] - ym) for k in range(3))
         den = sum((xs[k] - xm) ** 2 for k in range(3))
-        if den == 0:
+        if den == 0.0:
             m = 0.0
         else:
             m = num / den
@@ -292,13 +308,13 @@ def analyze_pump_cycles(data):
         return m, b
 
     # ---------------------------------------------------------
-    # Spočítá kandidáta pro okno začínající na start_idx
+    # Spočítá kandidáta (UP) pro okno začínající na start_idx
     # ---------------------------------------------------------
     def compute_window(start_idx):
-        if start_idx + 6 > n:
+        if start_idx + REG_WIN > n:
             return None
 
-        win = data[start_idx:start_idx + 6]
+        win = data[start_idx:start_idx + REG_WIN]
         t0 = win[0][0]
         pts = [((t - t0).total_seconds(), float(h)) for (t, h) in win]
         xs = [p[0] for p in pts]
@@ -310,14 +326,14 @@ def analyze_pump_cycles(data):
         mL, bL = linreg_3pts(left)
         mR, bR = linreg_3pts(right)
 
-        # průsečík přímek
+        # Průsečík přímek
         if abs(mL - mR) < 1e-12:
             return None
 
         x_int = (bR - bL) / (mL - mR)
-        y_int = mL * x_int + bL  # ŽÁDNÉ clampování na min/max ys
+        y_int = mL * x_int + bL  # BEZ clampu – čistá hodnota průsečíku
 
-        # orientovaný úhel
+        # Orientovaný úhel mezi směry přímek
         phiL = math.atan(mL)
         phiR = math.atan(mR)
         delta = phiR - phiL
@@ -329,7 +345,8 @@ def analyze_pump_cycles(data):
         angle_signed_deg = math.degrees(delta)
         angle_abs_deg = abs(angle_signed_deg)
 
-        if angle_abs_deg < ANGLE_THRESHOLD_DEG:
+        # Pod prahem → žádný kandidát, dle zadání posouváme dál
+        if angle_abs_deg < TH:
             return None
 
         typ = "U" if angle_signed_deg > 0 else "A"
@@ -346,43 +363,31 @@ def analyze_pump_cycles(data):
         }
 
     # ---------------------------------------------------------
-    # Z nejlepší šestice uděláme finální A/U event
+    # Z „nejlepší“ šestice (max |UP|) uděláme finální A/U event
     # ---------------------------------------------------------
     def finalize_event(best):
-        """
-        Přesně podle zadání:
-
-        1) Pokud průsečík leží časově mezi 3. a 4. bodem šestice:
-           → použijeme průsečík (čas + hladina).
-
-        2) Pokud NEleží mezi 3. a 4. bodem:
-           → použijeme max/min z celé šestice:
-              - typ == "U"  → minimum (dno)
-              - typ == "A"  → maximum (vrchol)
-        """
         start_idx = best["start_idx"]
         times = best["times"]
         levels = best["levels"]
 
         t0 = times[0]
-        t3 = times[2]  # 3. bod šestice
-        t4 = times[3]  # 4. bod šestice
+        t3 = times[2]  # 3. bod
+        t4 = times[3]  # 4. bod
 
-        # čas průsečíku
         ev_time_int = t0 + timedelta(seconds=best["x_int"])
         typ = best["typ"]
 
-        # 1) Ideální případ – průsečík mezi 3. a 4. bodem
+        # 1) Průsečík mezi 3. a 4. bodem → použij průsečík
         if t3 <= ev_time_int <= t4:
             ev_time = ev_time_int
             ev_level = best["y_int"]
             reason = "intersection_3_4"
         else:
-            # 2) Průsečík mimo → použijeme lokální extrém z celé šestice
+            # 2) Průsečík mimo → lokální extrém celé šestice
             if typ == "U":
-                idx_ext = min(range(6), key=lambda k: levels[k])
+                idx_ext = min(range(REG_WIN), key=lambda k: levels[k])
             else:  # "A"
-                idx_ext = max(range(6), key=lambda k: levels[k])
+                idx_ext = max(range(REG_WIN), key=lambda k: levels[k])
             ev_time = times[idx_ext]
             ev_level = levels[idx_ext]
             reason = f"extrem_idx_{idx_ext}"
@@ -400,40 +405,42 @@ def analyze_pump_cycles(data):
             "start_idx": start_idx,
         }
 
-
     # ---------------------------------------------------------
-    # Hlavní smyčka přes data: hledání shluku UP,UP1,... a maxima
+    # Hlavní smyčka dle UP / UP1 / UP2...
     # ---------------------------------------------------------
     events = []
     last_type = None
     i = 0
 
-    while i <= n - 6:
-        # 1) najdi první okno s |UP|>=threshold od pozice i
+    while i <= n - REG_WIN:
+        # Najdeme PRVNÍ okno od i, které překročí threshold
         first = None
-        while i <= n - 6:
-            cand = compute_window(i)
-            if cand is not None:
-                first = cand
+        while i <= n - REG_WIN:
+            cand0 = compute_window(i)
+            if cand0 is not None:
+                first = cand0
                 break
             i += 1
 
         if first is None:
-            break  # už žádné kandidátní okno
+            break  # žádný další kandidát
 
         base_type = first["typ"]
         best = first
         dbg(f"[AU] start cluster at i={i} typ={base_type} UP={first['angle_abs']:.2f}")
 
         j = i + 1
-        # 2) hledáme UP1,UP2... dokud neklesne nebo se nezmění typ
-        while j <= n - 6:
+        # Teď jedeme UP1, UP2... dokud:
+        #  - je typ stejný
+        #  - |UP| >= threshold (tj. compute_window nevrací None)
+        #  - a případně UP roste
+        while j <= n - REG_WIN:
             evj = compute_window(j)
             if evj is None:
-                dbg(f"[AU] j={j}: below threshold / degenerace -> end cluster")
+                dbg(f"[AU]   j={j}: pod prahem / degenerace → konec clusteru")
                 break
             if evj["typ"] != base_type:
-                dbg(f"[AU] j={j}: type change {base_type}->{evj['typ']} -> end cluster")
+                dbg(f"[AU]   j={j}: změna typu {base_type}->{evj['typ']} → konec clusteru")
                 break
 
             dbg(f"[AU]   j={j} typ={evj['typ']} UP={evj['angle_abs']:.2f}")
@@ -444,24 +451,24 @@ def analyze_pump_cycles(data):
                 j += 1
                 continue
             else:
-                dbg(f"[AU]   UP stopped growing at j={j} -> accept best at {best['start_idx']}")
+                dbg(f"[AU]   UP přestal růst v j={j} → přijímám best na {best['start_idx']}")
                 break
 
-        # 3) z nejlepší šestice uděláme event
+        # Finalizujeme event z nejlepší šestice v clusteru
         ev = finalize_event(best)
 
-        # vynucené střídání A/U (po A jen U, po U jen A)
+        # vynucené střídání A/U (po A musí být U, po U A)
         if (last_type is None) or (ev["typ"] != last_type):
             events.append(ev)
             last_type = ev["typ"]
         else:
-            dbg(f"[AU]   SKIP {ev['typ']} at {ev['cas'].strftime('%H:%M:%S')} (same type as last={last_type})")
+            dbg(f"[AU]   SKIP {ev['typ']} at {ev['cas'].strftime('%H:%M:%S')} (stejný typ jako poslední={last_type})")
 
-        # 4) index posuneme podle dohody: nový start = 4. bod šestice
+        # DŮLEŽITÉ: posun indexu dle zadání → 4. bod vítězné šestice
         i = best["start_idx"] + 3
 
     # ---------------------------------------------------------
-    # Z eventů (A/U) sestavíme cykly
+    # Z eventů A/U postavíme cykly
     # ---------------------------------------------------------
     if len(events) < 2:
         return []
@@ -488,7 +495,6 @@ def analyze_pump_cycles(data):
         v2 = cm_to_liters_local(h2)
         diff_v = abs(v2 - v1)
 
-        # stav podle PREV: A → čerpání, U → plnění
         stav = "CERPANI" if prev["typ"] == "A" else "PLNENI"
         rychlost = diff_v / trvani if trvani > 0 else 0.0
 
@@ -501,11 +507,11 @@ def analyze_pump_cycles(data):
             rych_vyc = rychlost
             rych_nat = 0.0
             vykon = rych_vyc + rych_nat
-            t_in = trvani  # nemáme v tomto režimu lepší info
+            t_in = trvani
             t_out = trvani
             pomer = (t_out / (t_out + t_in) * 100.0) if (t_out + t_in) > 0 else 0.0
 
-        cycle = {
+        cycles.append({
             "typ": prev["typ"],
             "cas": prev["cas"],
             "zacatek": t_start,
@@ -520,9 +526,7 @@ def analyze_pump_cycles(data):
             "pomer_pct": round(pomer, 1),
             "stav": stav,
             "window": prev["window"],
-        }
-
-        cycles.append(cycle)
+        })
 
     return cycles
 
