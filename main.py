@@ -310,17 +310,12 @@ def analyze_pump_cycles(data):
         mL, bL = linreg_3pts(left)
         mR, bR = linreg_3pts(right)
 
-        # průsečík
+        # průsečík přímek
         if abs(mL - mR) < 1e-12:
             return None
 
         x_int = (bR - bL) / (mL - mR)
-        y_int = mL * x_int + bL
-
-        # omezíme průsečík na rozsah hodnot šestice
-        min_h = min(ys)
-        max_h = max(ys)
-        y_int = max(min(y_int, max_h), min_h)
+        y_int = mL * x_int + bL  # ŽÁDNÉ clampování na min/max ys
 
         # orientovaný úhel
         phiL = math.atan(mL)
@@ -354,24 +349,36 @@ def analyze_pump_cycles(data):
     # Z nejlepší šestice uděláme finální A/U event
     # ---------------------------------------------------------
     def finalize_event(best):
+        """
+        Přesně podle zadání:
+
+        1) Pokud průsečík leží časově mezi 3. a 4. bodem šestice:
+           → použijeme průsečík (čas + hladina).
+
+        2) Pokud NEleží mezi 3. a 4. bodem:
+           → použijeme max/min z celé šestice:
+              - typ == "U"  → minimum (dno)
+              - typ == "A"  → maximum (vrchol)
+        """
         start_idx = best["start_idx"]
         times = best["times"]
         levels = best["levels"]
 
         t0 = times[0]
-        t3 = times[2]
-        t4 = times[3]
+        t3 = times[2]  # 3. bod šestice
+        t4 = times[3]  # 4. bod šestice
 
+        # čas průsečíku
         ev_time_int = t0 + timedelta(seconds=best["x_int"])
         typ = best["typ"]
 
-        # 1) ideální případ: průsečík mezi 3. a 4. bodem
+        # 1) Ideální případ – průsečík mezi 3. a 4. bodem
         if t3 <= ev_time_int <= t4:
             ev_time = ev_time_int
             ev_level = best["y_int"]
             reason = "intersection_3_4"
         else:
-            # 2) fallback: extrém z celé šestice
+            # 2) Průsečík mimo → použijeme lokální extrém z celé šestice
             if typ == "U":
                 idx_ext = min(range(6), key=lambda k: levels[k])
             else:  # "A"
@@ -392,6 +399,7 @@ def analyze_pump_cycles(data):
             "angle_signed": round(best["angle_signed"], 2),
             "start_idx": start_idx,
         }
+
 
     # ---------------------------------------------------------
     # Hlavní smyčka přes data: hledání shluku UP,UP1,... a maxima
