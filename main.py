@@ -617,11 +617,12 @@ def fetch_once(url):
 def simulate_from_file(csv_path):
     """
     Offline režim:
-    - čte vstupní CSV bod po bodu,
-    - každý nový bod přidá do data_points,
-    - na každém kroku spustí analyze_pump_cycles(data_points),
-    - nové cykly (podle času konce) zapisuje do OFFLINE CSV.
+    - načte celý CSV soubor (čas, hladina),
+    - data jsou brána postupně v pořadí v souboru,
+    - po načtení všech bodů jednou spustí analyze_pump_cycles(data_points),
+    - všechny cykly zapíše do OFFLINE souboru cykly_cerpadla_OFFLINE.csv
     """
+
     global OFFLINE_FLAG
     OFFLINE_FLAG = True
 
@@ -629,13 +630,8 @@ def simulate_from_file(csv_path):
         print(f"[SIM] Soubor nenalezen: {csv_path}")
         return
 
-    print(f"[SIM] Offline simulace: {csv_path}")
-
     data_points = []
-    last_time = None
-    last_cycle_end = None
     total_points = 0
-    total_cycles = 0
 
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
@@ -665,26 +661,23 @@ def simulate_from_file(csv_path):
                 except Exception:
                     continue
 
-                # potlačení duplicitních časů
-                if last_time and abs((t - last_time).total_seconds()) < 0.5:
-                    continue
-
                 data_points.append((t, level))
                 total_points += 1
-                last_time = t
 
-                # zavoláme sjednocenou detekci
-                cycles = analyze_pump_cycles(data_points)
+        if not data_points:
+            print("[SIM] Žádná platná data.")
+            return
 
-                # zapíšeme jen nové cykly (podle koncového času)
-                for c in cycles:
-                    end_t = c.get("konec") or c.get("cas")
-                    if last_cycle_end is None or (end_t and end_t > last_cycle_end):
-                        write_cycle_to_csv(c, offline=True)
-                        last_cycle_end = end_t
-                        total_cycles += 1
+        print(f"[SIM] Načteno {total_points} bodů. Spouštím A/U analýzu...")
 
-        print(f"[SIM] Načteno {total_points} bodů, detekováno {total_cycles} cyklů (offline).")
+        cycles = analyze_pump_cycles(data_points)
+
+        print(f"[SIM] Detekováno {len(cycles)} cyklů. Zapisuji do OFFLINE CSV...")
+
+        for c in cycles:
+            write_cycle_to_csv(c, offline=True)
+
+        print("[SIM] Hotovo.")
 
     except Exception as e:
         print("[SIM] Chyba při čtení/offline analýze:", e)
