@@ -26,7 +26,7 @@ except Exception:
     SerialException = Exception
     _HAS_SERIAL = False
 
-# =============================================================
+# ============================================================= bum
 # KONFIGURACE
 # =============================================================
 BASE_DIR = r"D:\data\Vojta\jimka"       # adresář pro všechny výstupy
